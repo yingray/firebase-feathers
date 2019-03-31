@@ -13,7 +13,8 @@ import { Server as WebSocketServer } from 'ws';
 import { getFirebaseHash } from './lib/firebase-hash';
 import { HttpServer } from './lib/http-server';
 import { normalize, TokenValidator } from './lib/token-validator';
-import { paginateRef } from './lib/paginate-ref';
+import { getPaginateQuery } from './lib/paginate-ref';
+import { client } from './feathers';
 
 // tslint:disable:no-var-requires
 const targaryen = require('targaryen');
@@ -171,6 +172,28 @@ class FirebaseServer {
 			}
 		}
 
+		const handleFeathersMessages = (msg) => {
+			const { data }= msg
+			const obj = {}
+			data.forEach(d => obj[d["id"] || d["_id"]] = d)
+			return obj
+	}
+
+		function find (path, sendOk, requestId, q) {
+			return client.service(path).find(getPaginateQuery(q)).then(message => {
+				console.log('find: ', path)
+				if (message) {
+					// BUG: tryRead() here, and if it throws, cancel the listener.
+					// See https://github.com/urish/firebase-server/pull/100#issuecomment-323509408
+					pushData(path, handleFeathersMessages(message));
+					if (sendOk) {
+						sendOk = false;
+						send({ d: { r: requestId, b: { s: 'ok', d: {} } }, t: 'd' });
+					}
+				}
+			})
+		}
+
 		function authData() {
 			let data;
 			if (authToken) {
@@ -250,17 +273,11 @@ class FirebaseServer {
 			}
 
 			let sendOk = true;
-			paginateRef(fbRef, q).on('value', (snap) => {
-				if (snap) {
-					// BUG: tryRead() here, and if it throws, cancel the listener.
-					// See https://github.com/urish/firebase-server/pull/100#issuecomment-323509408
-					pushData(path, snap.exportVal());
-					if (sendOk) {
-						sendOk = false;
-						send({ d: { r: requestId, b: { s: 'ok', d: {} } }, t: 'd' });
-					}
-				}
-			});
+			find(path, sendOk, requestId, q)
+			client.service(path).on('created', () => find(path, sendOk, requestId, q))
+			client.service(path).on('updated', () => find(path, sendOk, requestId, q))
+			client.service(path).on('patched', () => find(path, sendOk, requestId, q))
+			client.service(path).on('removed', () => find(path, sendOk, requestId, q))
 		}
 
 		function handleUpdate(
@@ -271,6 +288,7 @@ class FirebaseServer {
 		) {
 			const path = normalizedPath.path;
 			log(`Client update ${path}`);
+			log(normalizedPath)
 
 			const now = server.clock || new Date().getTime();
 			newData = replaceServerTimestamp(now, newData);
@@ -281,9 +299,10 @@ class FirebaseServer {
 				log(e);
 				return;
 			}
-
-			fbRef.update(newData);
-			send({ d: { r: requestId, b: { s: 'ok', d: {} } }, t: 'd' });
+			// fbRef.update(newData);
+			log(newData)
+			Promise.all(Object.keys(newData).map(id => client.service(path).update(id, newData[id])))
+				.then(() => send({ d: { r: requestId, b: { s: 'ok', d: {} } }, t: 'd' }))
 		}
 
 		function handleSet(
@@ -294,6 +313,7 @@ class FirebaseServer {
 			hash?: string,
 		) {
 			log(`Client set ${normalizedPath.fullPath}`);
+			log(normalizedPath)
 
 			let progress = Promise.resolve();
 			const path = normalizedPath.path;
@@ -331,10 +351,13 @@ class FirebaseServer {
 			}
 
 			progress.then(() => {
-				fbRef.set(newData);
-				fbRef.once('value', (snap) => {
-					send({ d: { r: requestId, b: { s: 'ok', d: {} } }, t: 'd' });
-				});
+				// fbRef.set(newData);
+				log(newData)
+				client.service(path).create(Object.assign(newData, {'_id': newData['id']}));
+				find(path, true, requestId, null)
+				// fbRef.once('value', (snap) => {
+				// 	send({ d: { r: requestId, b: { s: 'ok', d: {} } }, t: 'd' });
+				// });
 			}).catch(log);
 		}
 
